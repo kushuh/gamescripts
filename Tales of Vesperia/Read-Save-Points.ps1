@@ -1,3 +1,5 @@
+#requires -Version 5.1
+
 <#
 .SYNOPSIS
     Display saved Tales of Vesperia: Definitive Edition progress.
@@ -13,87 +15,133 @@
     Cannot be combined with SaveDirectory.
 .PARAMETER AsJson
     Return structured progress instead of the human-readable terminal table.
+.PARAMETER ShowSavePath
+    Include the full local save path in the table header or JSON SaveFile field.
+    By default, only the filename is shown, keeping account and user folder names
+    out of output. This option also enables detailed file-access error messages.
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Read-Save-Points.ps1
 .EXAMPLE
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Read-Save-Points.ps1 -SaveDirectory "D:\Steam\userdata\ACCOUNT_ID\738540\remote"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Read-Save-Points.ps1 -SaveDirectory "D:\Steam\userdata\ACCOUNT_ID\738540\remote" -ShowSavePath
 .NOTES
     Save in game first: unsaved progress is not present on disk. The process-local
     execution-policy option in the launcher does not change Windows policy.
     Exit code 0 means success; 1 means the save could not be found or decoded.
-    All save access uses read-only operations. Concurrent game saves trigger retries.
+    Saves are opened for reading with sharing enabled. Two bounded reads, hashes,
+    and timestamps guard against concurrent writes; no save content is executed.
+    The 16 MiB input limit comfortably exceeds the supported PC save size.
 #>
 [CmdletBinding()]
 param(
     [string]$SaveDirectory,
     [string]$SaveFile,
-    [switch]$AsJson
+    [switch]$AsJson,
+    [switch]$ShowSavePath
 )
 
 $ErrorActionPreference = 'Stop'
 
+function Stop-ProgressCheck {
+    param([string]$Message)
+    # Mark safe, fixed messages separately from system errors, which may contain
+    # personal paths. The outer handler prints full system details only on request.
+    $exception = [IO.InvalidDataException]::new($Message)
+    $exception.Data['ProgressCheckerMessage'] = $Message
+    throw $exception
+}
+
+function Write-ProgressError {
+    param([string]$Context, [Management.Automation.ErrorRecord]$Record)
+    $message = 'The save could not be read. Check the selected file and folder, wait for saving to finish, and try again.'
+    $exception = $Record.Exception
+    while ($null -ne $exception) {
+        if ($exception.Data.Contains('ProgressCheckerMessage')) {
+            $message = [string]$exception.Data['ProgressCheckerMessage']
+            break
+        }
+        $exception = $exception.InnerException
+    }
+    if ($ShowSavePath -and $null -eq $exception) { $message = $Record.Exception.Message }
+    Write-Host ($Context + ': ' + $message) -ForegroundColor Red
+}
+
 function Get-SteamRoots {
-    # Steam registry values support custom drives; environment-based fallbacks
-    # avoid hardcoded drive letters or Windows users.
+    # Read registry/environment values only. Bad or stale installation entries
+    # must not prevent another valid Steam installation from being discovered.
     $roots = @()
     foreach ($key in @('HKCU:\Software\Valve\Steam',
                        'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam',
                        'HKLM:\SOFTWARE\Valve\Steam')) {
-        $settings = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+        try { $settings = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue }
+        catch { continue }
         if ($null -eq $settings) { continue }
         foreach ($property in @('SteamPath', 'InstallPath')) {
             if ($settings.$property) { $roots += [string]$settings.$property }
         }
         if ($settings.SteamExe) {
-            $roots += Split-Path -Parent ([string]$settings.SteamExe).Trim('"')
+            try {
+                $exe = [Environment]::ExpandEnvironmentVariables(([string]$settings.SteamExe).Trim().Trim('"')).Replace('/', '\')
+                $roots += [IO.Path]::GetDirectoryName($exe)
+            } catch { <# Ignore malformed registry values. #> }
         }
     }
     foreach ($variable in @('ProgramFiles(x86)', 'ProgramFiles', 'ProgramW6432', 'LOCALAPPDATA')) {
         $folder = [Environment]::GetEnvironmentVariable($variable)
-        if ($folder) { $roots += Join-Path $folder 'Steam' }
+        if ($folder) { $roots += $folder.Trim().Trim('"').TrimEnd('\', '/') + '\Steam' }
     }
-    $roots | Where-Object { $_ } | ForEach-Object {
-        [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($_).Replace('/', '\'))
-    } | Sort-Object -Unique
+    foreach ($candidate in $roots) {
+        if (-not $candidate) { continue }
+        try {
+            $path = [Environment]::ExpandEnvironmentVariables($candidate.Trim().Trim('"')).Replace('/', '\')
+            # Automatic discovery is restricted to absolute local drive paths;
+            # it never resolves relative paths or probes network shares from the registry.
+            if ($path -notmatch '^[A-Za-z]:\\') { continue }
+            [IO.Path]::GetFullPath($path)
+        } catch { <# Continue with other registry values and fallback folders. #> }
+    }
 }
 
 function Get-SaveDirectories {
     if ($SaveDirectory) {
         if (-not (Test-Path -LiteralPath $SaveDirectory -PathType Container)) {
-            throw "Save folder not found: $SaveDirectory"
+            Stop-ProgressCheck 'Save folder not found.'
         }
-        return (Get-Item -LiteralPath $SaveDirectory).FullName
+        $folder = Get-Item -LiteralPath $SaveDirectory
+        if ($folder -isnot [IO.DirectoryInfo]) { Stop-ProgressCheck 'Select a filesystem save folder.' }
+        return $folder.FullName
     }
     # Saves live under the Steam client, even if the game uses another library.
-    # Search all numeric account folders instead of assuming one Steam account.
-    $directories = foreach ($root in Get-SteamRoots) {
-        $userdata = Join-Path $root 'userdata'
-        if (-not (Test-Path -LiteralPath $userdata -PathType Container)) { continue }
+    # Search numeric account folders, without assuming one particular account.
+    $directories = foreach ($root in (Get-SteamRoots | Sort-Object -Unique)) {
+        $userdata = [IO.Path]::Combine($root, 'userdata')
+        if (-not (Test-Path -LiteralPath $userdata -PathType Container -ErrorAction SilentlyContinue)) { continue }
         foreach ($account in Get-ChildItem -LiteralPath $userdata -Directory -ErrorAction SilentlyContinue) {
             if ($account.Name -notmatch '^\d+$') { continue }
-            $remote = Join-Path $account.FullName '738540\remote'
-            if (Test-Path -LiteralPath $remote -PathType Container) { $remote }
+            $remote = [IO.Path]::Combine($account.FullName, '738540\remote')
+            if (Test-Path -LiteralPath $remote -PathType Container -ErrorAction SilentlyContinue) { $remote }
         }
     }
     $directories | Sort-Object -Unique
 }
 
 function Get-LatestSave {
-    # An explicit file wins. Otherwise choose the newest checkpoint in scope.
-    # Never combine progress from different files or Steam accounts.
+    # Never combine progress from different files or accounts. Report a damaged
+    # newest save instead of silently substituting an older checkpoint.
     if ($SaveFile) {
-        if ($SaveDirectory) { throw 'Use either -SaveFile or -SaveDirectory, not both.' }
+        if ($SaveDirectory) { Stop-ProgressCheck 'Use either -SaveFile or -SaveDirectory, not both.' }
         if (-not (Test-Path -LiteralPath $SaveFile -PathType Leaf)) {
-            throw "Save file not found: $SaveFile"
+            Stop-ProgressCheck 'Save file not found.'
         }
-        return Get-Item -LiteralPath $SaveFile
+        $file = Get-Item -LiteralPath $SaveFile
+        if ($file -isnot [IO.FileInfo]) { Stop-ProgressCheck 'Select a filesystem save file.' }
+        return $file
     }
     $files = @(foreach ($directory in Get-SaveDirectories) {
         Get-ChildItem -LiteralPath $directory -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match '^TLSaveData\d+_\d+$' }
     })
     if ($files.Count -eq 0) {
-        throw 'No Steam Vesperia saves found. Save in game first, or run this .ps1 with -SaveDirectory pointing to your 738540\remote folder.'
+        Stop-ProgressCheck 'No Steam Vesperia saves found. Save in game first, or run this .ps1 with -SaveDirectory pointing to your 738540\remote folder.'
     }
     return $files | Sort-Object LastWriteTimeUtc, FullName -Descending | Select-Object -First 1
 }
@@ -101,29 +149,58 @@ function Get-LatestSave {
 function Read-UInt32 {
     param([byte[]]$Data, [long]$Offset)
     if ($Offset -lt 0 -or $Offset + 4 -gt $Data.LongLength) {
-        throw 'The save is incomplete or has an unsupported format.'
+        Stop-ProgressCheck 'The save is incomplete or has an unsupported format.'
     }
     return [BitConverter]::ToUInt32($Data, [int]$Offset)
 }
 
+function Read-BoundedSave {
+    param([string]$Path)
+    # Bound allocation even for a wrongly selected or damaged file. Open read-only
+    # and permit the game to write or replace its file while this checker runs.
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    try {
+        $length = $stream.Length
+        if ($length -gt 16MB) { Stop-ProgressCheck 'The selected file is too large to be a supported Vesperia save.' }
+        $data = New-Object byte[] ([int]$length)
+        $read = 0
+        while ($read -lt $length) {
+            $count = $stream.Read($data, $read, [int]($length - $read))
+            if ($count -eq 0) { Stop-ProgressCheck 'The game is currently saving. Try again after saving finishes.' }
+            $read += $count
+        }
+        if ($stream.Length -ne $length -or $stream.ReadByte() -ne -1) {
+            Stop-ProgressCheck 'The game is currently saving. Try again after saving finishes.'
+        }
+        # Prevent PowerShell from enumerating every byte through the pipeline.
+        return ,$data
+    } finally { $stream.Dispose() }
+}
+
+function Get-BytesHash {
+    param([byte[]]$Data)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($hasher.ComputeHash($Data)).Replace('-', '') }
+    finally { $hasher.Dispose() }
+}
+
 function Get-SaveSnapshot {
-    # Retry a concurrent save instead of reporting partially written data.
+    # Retry concurrent or temporarily locked saves, comparing two bounded reads.
     for ($attempt = 0; $attempt -lt 3; $attempt++) {
         try {
             $file = Get-LatestSave
             $stamp = $file.LastWriteTimeUtc
             $length = $file.Length
-            $data = [IO.File]::ReadAllBytes($file.FullName)
-            $hasher = [Security.Cryptography.SHA256]::Create()
-            try {
-                $hash = [BitConverter]::ToString($hasher.ComputeHash($data)).Replace('-', '')
-            } finally { $hasher.Dispose() }
+            $data = Read-BoundedSave $file.FullName
+            $hash = Get-BytesHash $data
+            $afterHash = Get-BytesHash (Read-BoundedSave $file.FullName)
             $after = Get-Item -LiteralPath $file.FullName
-            $afterHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
             $latest = Get-LatestSave
-            if ($after.LastWriteTimeUtc -ne $stamp -or $after.Length -ne $length -or
-                $hash -ne $afterHash -or $latest.FullName -ne $file.FullName) {
-                throw 'The game is currently saving. Try again after saving finishes.'
+            if ($data.LongLength -ne $length -or $after.LastWriteTimeUtc -ne $stamp -or
+                $after.Length -ne $length -or $hash -ne $afterHash -or
+                $latest.FullName -ne $file.FullName) {
+                Stop-ProgressCheck 'The game is currently saving. Try again after saving finishes.'
             }
             return [pscustomobject]@{ File = $file; Data = $data; Hash = $hash }
         } catch {
@@ -135,46 +212,62 @@ function Get-SaveSnapshot {
 
 function Get-SaveSections {
     param([byte[]]$Data)
-    # PC saves wrap TO8SAVE in 0x228 bytes. Its directory supplies section
-    # positions; character, save-point, and Scenario offsets are not hardcoded.
+    # PC saves wrap TO8SAVE in 0x228 bytes. Read section positions from the
+    # directory, checking every range before any checker accesses its contents.
     $base = 0x228
     if ($Data.Length -lt $base + 0x30 -or
         [Text.Encoding]::ASCII.GetString($Data, $base, 7) -ne 'TO8SAVE') {
-        throw 'This is not a supported Steam Definitive Edition save.'
+        Stop-ProgressCheck 'This is not a supported Steam Definitive Edition save.'
     }
     $meta = [long](Read-UInt32 $Data ($base + 0x20))
     $count = Read-UInt32 $Data ($base + 0x24)
     $content = [long](Read-UInt32 $Data ($base + 0x28))
     $strings = [long](Read-UInt32 $Data ($base + 0x2c))
-    if ($count -lt 1 -or $count -gt 256) { throw 'Unsupported save section directory.' }
+    if ($count -lt 1 -or $count -gt 256 -or $meta -lt 0x30 -or
+        $meta + [long]$count * 32 -gt $content -or $content -gt $strings -or
+        $base + $strings -ge $Data.LongLength) {
+        Stop-ProgressCheck 'Unsupported save section directory.'
+    }
     $sections = @{}
     for ($index = 0; $index -lt $count; $index++) {
         $entry = $base + $meta + $index * 32
         $nameAt = $base + $strings + [long](Read-UInt32 $Data $entry)
         $offset = $base + $content + [long](Read-UInt32 $Data ($entry + 4))
         $size = [long](Read-UInt32 $Data ($entry + 8))
-        if ($nameAt -ge $Data.LongLength -or $offset + $size -gt $Data.LongLength) {
-            throw 'The save contains an invalid section.'
+        if ($nameAt -ge $Data.LongLength -or $size -lt 1 -or $offset + $size -gt $base + $strings) {
+            Stop-ProgressCheck 'The save contains an invalid section.'
         }
         $nameEnd = $nameAt
         while ($nameEnd -lt $Data.LongLength -and $Data[$nameEnd] -ne 0 -and
                $nameEnd - $nameAt -lt 64) { $nameEnd++ }
         if ($nameEnd -ge $Data.LongLength -or $Data[$nameEnd] -ne 0 -or $nameEnd -eq $nameAt) {
-            throw 'The save contains an invalid section name.'
+            Stop-ProgressCheck 'The save contains an invalid section name.'
         }
         $name = [Text.Encoding]::ASCII.GetString($Data, [int]$nameAt, [int]($nameEnd - $nameAt))
-        if ($sections.ContainsKey($name)) { throw 'The save contains duplicate sections.' }
+        if ($name -cnotmatch '^[A-Za-z0-9_]{1,63}$') { Stop-ProgressCheck 'The save contains an invalid section name.' }
+        if ($sections.ContainsKey($name)) { Stop-ProgressCheck 'The save contains duplicate sections.' }
         $sections[$name] = @{ Offset = $offset; Size = $size }
     }
+    $end = $base + $content
+    foreach ($section in ($sections.Values | Sort-Object { $_.Offset })) {
+        if ($section.Offset -lt $end) { Stop-ProgressCheck 'The save contains overlapping sections.' }
+        $end = $section.Offset + $section.Size
+    }
     return $sections
+}
+
+function Get-DisplaySaveName {
+    param($Snapshot)
+    if ($ShowSavePath) { return $Snapshot.File.FullName }
+    return $Snapshot.File.Name
 }
 
 function Show-ProgressHeader {
     param([string]$Name, $Snapshot)
     Write-Host ''
     Write-Host ('Tales of Vesperia: Definitive Edition - ' + $Name)
-    Write-Host ('Save file: ' + $Snapshot.File.FullName)
-    Write-Host ('Saved: ' + $Snapshot.File.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss') + ' (local time)')
+    Write-Host ('Save file: ' + (Get-DisplaySaveName $Snapshot))
+    Write-Host ('Saved: ' + $Snapshot.File.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ' (local time)')
     if (-not $SaveFile -and -not $SaveDirectory) {
         Write-Host 'Auto-selection uses the newest save across detected Steam accounts.'
     }
@@ -183,12 +276,18 @@ function Show-ProgressHeader {
 
 function Write-ProgressJson {
     param($Snapshot, $Rows)
-    [pscustomobject]@{
-        SaveFile = $Snapshot.File.FullName
-        SavedAt = $Snapshot.File.LastWriteTime.ToString('o')
+    $json = [pscustomobject]@{
+        SaveFile = Get-DisplaySaveName $Snapshot
+        SavedAt = $Snapshot.File.LastWriteTime.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
         SHA256 = $Snapshot.Hash
         Rows = @($Rows)
     } | ConvertTo-Json -Depth 6
+    # Escaping Unicode preserves filenames when Windows PowerShell redirects
+    # JSON using a legacy terminal code page, including non-Latin user folders.
+    [regex]::Replace($json, '[^\x00-\x7f]', {
+        param($match)
+        '\u{0:x4}' -f [int][char]$match.Value
+    })
 }
 
 function Show-ProgressTable {
@@ -300,18 +399,17 @@ try {
     $sections = Get-SaveSections $data
     $section = $sections['SavePoint']
     if ($null -eq $section -or $section.Size -ne 0x400) {
-        throw 'Missing or unsupported save-point data.'
+        Stop-ProgressCheck 'Missing or unsupported save-point data.'
     }
     # SavePoint uses one byte per registration, not packed bits.
-    # Layout: HyoutaTools SaveDataBlockSavePoint.cs; first 44 guide mappings
-    # independently checked against this player's earlier snapshots.
+    # Layout: HyoutaTools SaveDataBlockSavePoint.cs.
     # https://github.com/AdmiralCurtiss/HyoutaTools/blob/master/HyoutaToolsLib/Tales/Vesperia/SaveData/SaveDataBlockSavePoint.cs
-    # Guide IDs differ from storage indexes; the CSV preserves guide labels.
+    # Checklist numbers differ from storage indexes; the CSV maps each location.
     # Shared registrations: 33/37 -> flag 2; 41/42 -> flag 38.
     # Grotto mapping: Four Isles/Nordopolica=62, shared chamber=63,
     # Ilyccia/Zaphias=60, Tolbyccia/Heliord=61, Yurzorea/Yumanju=59.
     $points = @'
-Guide,Flag,Location,Shared
+Point,Flag,Location,Shared
 1,5,"Zaphias, Lower Quarter",
 2,7,"Zaphias, castle prison !",
 3,9,"Zaphias, upper castle hall !",
@@ -405,7 +503,7 @@ Guide,Flag,Location,Shared
 91,88,"Abysm bottom",
 '@ | ConvertFrom-Csv
     for ($flag = 0; $flag -lt 89; $flag++) {
-        if ($data[$section.Offset + $flag] -gt 1) { throw 'Unexpected save-point flag value.' }
+        if ($data[$section.Offset + $flag] -gt 1) { Stop-ProgressCheck 'Unexpected save-point flag value.' }
     }
     $registered = 0
     for ($flag = 0; $flag -lt 89; $flag++) {
@@ -416,7 +514,7 @@ Guide,Flag,Location,Shared
         $status = if ($used) { 'Used' } else { 'Not used yet' }
         if ($point.Shared) { $status += ' *' }
         [pscustomobject]@{
-            Guide = [int]$point.Guide
+            Point = [int]$point.Point
             Status = $status
             Location = $point.Location
             Used = $used
@@ -426,8 +524,8 @@ Guide,Flag,Location,Shared
     })
     if ($AsJson) { Write-ProgressJson $snapshot $rows; exit 0 }
     Show-ProgressHeader 'Save Points' $snapshot
-    Write-Host ("Registered flags in this save: $registered / 89 (91 guide entries).")
-    Write-Host 'Numbers match the guide. ! = temporary or time-sensitive location.'
+    Write-Host ("Registered flags in this save: $registered / 89 (91 checklist entries).")
+    Write-Host '! = temporary or time-sensitive location.'
     Write-Host ''
     # Short groups make the 91-entry checklist easier to scan without changing order.
     $groups = @(
@@ -438,9 +536,9 @@ Guide,Flag,Location,Shared
     )
     foreach ($group in $groups) {
         Write-Host ('  ' + $group.Name + ' | ' + $group.First + '-' + $group.Last) -ForegroundColor Cyan
-        $groupRows = @($rows | Where-Object { $_.Guide -ge $group.First -and $_.Guide -le $group.Last })
-        Show-ProgressTable -Rows $groupRows -Columns @('Guide', 'Status', 'Location') `
-            -RightAlign @('Guide') -StatusColumn 'Status' -IsComplete { param($row) $row.Used }
+        $groupRows = @($rows | Where-Object { $_.Point -ge $group.First -and $_.Point -le $group.Last })
+        Show-ProgressTable -Rows $groupRows -Columns @('Point', 'Status', 'Location') `
+            -RightAlign @('Point') -StatusColumn 'Status' -IsComplete { param($row) $row.Used }
     }
     Write-Host '* 33/37 share one flag; 41/42 share another. Each pair shows the same status.'
     Write-Host 'A used shared flag does not identify which individual appearance you visited.'
@@ -448,6 +546,6 @@ Guide,Flag,Location,Shared
     Write-Host 'Save in game before checking. This command only reads your saves.'
     exit 0
 } catch {
-    Write-Host ('Could not read save-point progress: ' + $_.Exception.Message) -ForegroundColor Red
+    Write-ProgressError 'Could not read save-point progress' $_
     exit 1
 }
