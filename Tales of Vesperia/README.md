@@ -15,6 +15,7 @@ Check your progress in **Tales of Vesperia: Definitive Edition** from a Windows 
 | `Check-Fatal-Strikes.bat` | Each character's Fatal Strike count, strikes remaining to reach 100, and title status. |
 | `Check-Save-Points.bat` | An ordered list of save-point locations, marked **Used** or **Not used yet**, grouped by story section. |
 | `Check-Secret-Missions.bat` | All 25 Secret Missions and their bosses, marked **Done** or **Not done**. |
+| `Check-Giganto-Monsters.bat` | All 11 Giganto monsters and their locations, marked **Defeated** or **Not defeated**, with your completion total. |
 
 ## How to use
 
